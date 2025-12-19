@@ -1,4 +1,5 @@
 .DS_Store
 images/
 pretrained_backbone/
+checkpoints/
 onsite_test_submission.csv
