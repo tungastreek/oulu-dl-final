@@ -1,6 +1,8 @@
+import argparse
+import json
 import os
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, Dict, Optional
 
 import pandas as pd
 from PIL import Image
@@ -13,7 +15,7 @@ from torchvision import transforms, models
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, cohen_kappa_score
 
 
-DISEASE_NAMES = ["DR", "Glaucoma", "AMD"]
+DISEASE_NAMES = ["D", "G", "A"]
 
 
 def get_device():
@@ -240,10 +242,9 @@ def predict_from_images(
             probs = torch.sigmoid(outputs).cpu().numpy()
             preds = (probs > 0.5).astype(int)
             for image_name, prob, pred in zip(image_names, probs, preds):
-                row = {"image": image_name}
+                row = {"id": image_name}
                 for idx, disease in enumerate(DISEASE_NAMES):
-                    row[f"prob_{disease}"] = float(prob[idx])
-                    row[f"pred_{disease}"] = int(pred[idx])
+                    row[disease] = int(pred[idx])
                 results.append(row)
 
     pd.DataFrame(results).to_csv(output_csv, index=False)
@@ -273,6 +274,12 @@ class RunnerConfig:
     predict_input_csv: Optional[str] = None
     predict_image_dir: Optional[str] = None
     predict_output_csv: str = "predictions.csv"
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "RunnerConfig":
+        known_fields = {field.name for field in cls.__dataclass_fields__.values()}
+        filtered = {key: value for key, value in data.items() if key in known_fields}
+        return cls(**filtered)
 
 
 def run_pipeline(config: RunnerConfig):
@@ -325,20 +332,50 @@ def run_pipeline(config: RunnerConfig):
 # main
 # ========================
 if __name__ == "__main__":
-    config = RunnerConfig(
-        backbone="resnet18",
-        train_csv="train.csv",
-        val_csv="val.csv",
-        test_csv="offsite_test.csv",
-        train_image_dir="./images/train",
-        val_image_dir="./images/val",
-        test_image_dir="./images/offsite_test",
-        pretrained_backbone="./pretrained_backbone/ckpt_resnet18_ep50.pt",
-        do_train=True,
-        do_test=True,
-        do_predict=False,
-        predict_input_csv="./predict.csv",
-        predict_image_dir="./images/predict",
-        predict_output_csv="predictions.csv",
-    )
+    parser = argparse.ArgumentParser(description="Train/test/predict retina models.")
+    parser.add_argument("--config", type=str, help="Path to JSON config file.")
+    parser.add_argument("--do-train", action="store_true", help="Enable training.")
+    parser.add_argument("--no-train", action="store_true", help="Disable training.")
+    parser.add_argument("--do-test", action="store_true", help="Enable testing.")
+    parser.add_argument("--no-test", action="store_true", help="Disable testing.")
+    parser.add_argument("--do-predict", action="store_true", help="Enable prediction.")
+    parser.add_argument("--no-predict", action="store_true", help="Disable prediction.")
+    parser.add_argument("--checkpoint-path", type=str, help="Path to a checkpoint to load.")
+    parser.add_argument("--pretrained-backbone", type=str, help="Path to pretrained backbone weights.")
+    parser.add_argument("--predict-input-csv", type=str, help="CSV listing images to predict.")
+    parser.add_argument("--predict-image-dir", type=str, help="Directory containing prediction images.")
+    parser.add_argument("--predict-output-csv", type=str, help="Output CSV path for predictions.")
+    args = parser.parse_args()
+
+    config_data: Dict[str, Any] = {}
+    if args.config:
+        with open(args.config, "r", encoding="utf-8") as handle:
+            config_data = json.load(handle)
+
+    config = RunnerConfig.from_dict(config_data)
+
+    if args.checkpoint_path:
+        config.checkpoint_path = args.checkpoint_path
+    if args.pretrained_backbone:
+        config.pretrained_backbone = args.pretrained_backbone
+    if args.predict_input_csv:
+        config.predict_input_csv = args.predict_input_csv
+    if args.predict_image_dir:
+        config.predict_image_dir = args.predict_image_dir
+    if args.predict_output_csv:
+        config.predict_output_csv = args.predict_output_csv
+
+    if args.do_train:
+        config.do_train = True
+    if args.no_train:
+        config.do_train = False
+    if args.do_test:
+        config.do_test = True
+    if args.no_test:
+        config.do_test = False
+    if args.do_predict:
+        config.do_predict = True
+    if args.no_predict:
+        config.do_predict = False
+
     run_pipeline(config)
