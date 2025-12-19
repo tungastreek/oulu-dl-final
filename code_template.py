@@ -184,7 +184,7 @@ def train_one_backbone(
     if pretrained_backbone is not None:
         load_checkpoint(model, pretrained_backbone, device)
 
-    inital_patience = 0
+    initial_patience = 0
     for epoch in range(epochs):
         model.train()
         train_loss = 0
@@ -214,13 +214,13 @@ def train_one_backbone(
 
         # save best
         if val_loss < best_val_loss:
-            inital_patience = 0
+            initial_patience = 0
             best_val_loss = val_loss
             torch.save(model.state_dict(), ckpt_path)
             print(f"Saved best model for {backbone} at {ckpt_path}")
         else:
-            inital_patience += 1
-            if inital_patience >= early_stopping_patience:
+            initial_patience += 1
+            if initial_patience >= early_stopping_patience:
                 print(f"Early stopping at epoch {epoch + 1} for {backbone}")
                 break
 
