@@ -127,16 +127,20 @@ def load_checkpoint(model, checkpoint_path, device):
 # ========================
 def train_one_backbone(
     backbone,
+    tuning_method,
     train_csv,
     val_csv,
     train_image_dir,
     val_image_dir,
-    epochs=10,
-    batch_size=32,
-    lr=1e-4,
-    img_size=256,
-    save_dir="checkpoints",
-    pretrained_backbone=None,
+    num_workers,
+    epochs,
+    early_stopping_patience,
+    batch_size,
+    lr,
+    weight_decay,
+    img_size,
+    save_dir,
+    pretrained_backbone,
 ):
     device = get_device()
     logger.info("Training device: %s", describe_device(device))
@@ -147,20 +151,29 @@ def train_one_backbone(
     # dataset & dataloader
     train_ds = RetinaMultiLabelDataset(train_csv, train_image_dir, transform)
     val_ds = RetinaMultiLabelDataset(val_csv, val_image_dir, transform)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=4)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
     # model
     model = build_model(backbone, num_classes=3, pretrained=False).to(device)
 
     for p in model.parameters():
-        p.requires_grad = True
-
+        p.requires_grad = False
+    if tuning_method == "classifier_only":
+        if backbone == "resnet18":
+            for p in model.fc.parameters():
+                p.requires_grad = True
+        elif backbone == "efficientnet":
+            for p in model.classifier.parameters():
+                p.requires_grad = True
+    elif tuning_method == "full":
+        for p in model.parameters():
+            p.requires_grad = True
     log_model_details(model, backbone)
 
     # loss & optimizer
     criterion = nn.BCEWithLogitsLoss()
-    optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
+    optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=lr, weight_decay=weight_decay)
 
     # training
     best_val_loss = float("inf")
@@ -171,6 +184,7 @@ def train_one_backbone(
     if pretrained_backbone is not None:
         load_checkpoint(model, pretrained_backbone, device)
 
+    inital_patience = 0
     for epoch in range(epochs):
         model.train()
         train_loss = 0
@@ -200,9 +214,15 @@ def train_one_backbone(
 
         # save best
         if val_loss < best_val_loss:
+            inital_patience = 0
             best_val_loss = val_loss
             torch.save(model.state_dict(), ckpt_path)
             print(f"Saved best model for {backbone} at {ckpt_path}")
+        else:
+            inital_patience += 1
+            if inital_patience >= early_stopping_patience:
+                print(f"Early stopping at epoch {epoch + 1} for {backbone}")
+                break
 
     return ckpt_path
 
@@ -259,7 +279,7 @@ def predict_from_images(
     transform = build_transforms(img_size)
 
     predict_ds = RetinaPredictDataset(image_csv, image_dir, transform)
-    predict_loader = DataLoader(predict_ds, batch_size=batch_size, shuffle=False, num_workers=4)
+    predict_loader = DataLoader(predict_ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
     model = build_model(backbone, num_classes=num_classes, pretrained=False).to(device)
     log_model_details(model, backbone)
@@ -287,15 +307,19 @@ def predict_from_images(
 class RunnerConfig:
     backbone: str = "resnet18"
     num_classes: int = 3
+    tuning_method: str = "full"
     train_csv: str = "train.csv"
     val_csv: str = "val.csv"
     test_csv: str = "offsite_test.csv"
     train_image_dir: str = "./images/train"
     val_image_dir: str = "./images/val"
     test_image_dir: str = "./images/offsite_test"
+    num_workers: int = 0
+    early_stopping_patience: int = 15
     epochs: int = 20
     batch_size: int = 32
     lr: float = 1e-5
+    weight_decay: float = 1e-4
     img_size: int = 256
     save_dir: str = "checkpoints"
     pretrained_backbone: Optional[str] = "./pretrained_backbone/ckpt_resnet18_ep50.pt"
@@ -340,14 +364,18 @@ def run_pipeline(config: RunnerConfig):
     checkpoint_path = config.checkpoint_path
     if config.do_train:
         checkpoint_path = train_one_backbone(
-            config.backbone,
-            config.train_csv,
-            config.val_csv,
-            config.train_image_dir,
-            config.val_image_dir,
+            backbone=config.backbone,
+            tuning_method=config.tuning_method,
+            train_csv=config.train_csv,
+            val_csv=config.val_csv,
+            train_image_dir=config.train_image_dir,
+            val_image_dir=config.val_image_dir,
+            num_workers=config.num_workers,
             epochs=config.epochs,
+            early_stopping_patience=config.early_stopping_patience,
             batch_size=config.batch_size,
             lr=config.lr,
+            weight_decay=config.weight_decay,
             img_size=config.img_size,
             save_dir=config.save_dir,
             pretrained_backbone=config.pretrained_backbone,
@@ -361,7 +389,7 @@ def run_pipeline(config: RunnerConfig):
     if config.do_test:
         transform = build_transforms(config.img_size)
         test_ds = RetinaMultiLabelDataset(config.test_csv, config.test_image_dir, transform)
-        test_loader = DataLoader(test_ds, batch_size=config.batch_size, shuffle=False, num_workers=4)
+        test_loader = DataLoader(test_ds, batch_size=config.batch_size, shuffle=False, num_workers=0)
         model = build_model(config.backbone, num_classes=config.num_classes, pretrained=False).to(device)
         log_model_details(model, config.backbone)
         load_checkpoint(model, checkpoint_path, device)
@@ -371,11 +399,11 @@ def run_pipeline(config: RunnerConfig):
         if config.predict_input_csv is None or config.predict_image_dir is None:
             raise ValueError("predict_input_csv and predict_image_dir are required for prediction.")
         predict_from_images(
-            config.backbone,
-            checkpoint_path,
-            config.predict_input_csv,
-            config.predict_image_dir,
-            config.predict_output_csv,
+            backbone=config.backbone,
+            checkpoint_path=checkpoint_path,
+            image_csv=config.predict_input_csv,
+            image_dir=config.predict_image_dir,
+            output_csv=config.predict_output_csv,
             img_size=config.img_size,
             batch_size=config.batch_size,
             num_classes=config.num_classes,
