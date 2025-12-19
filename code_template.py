@@ -1,5 +1,6 @@
 import argparse
 import json
+import logging
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -17,13 +18,39 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_sc
 
 DISEASE_NAMES = ["D", "G", "A"]
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
 
 def get_device():
     if torch.cuda.is_available():
         return torch.device("cuda")
-    if torch.backends.mps.is_available():
+    if torch.backends.mps.is_available() and torch.backends.mps.is_built():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def describe_device(device: torch.device) -> str:
+    if device.type == "cuda":
+        return f"cuda ({torch.cuda.get_device_name(device)})"
+    if device.type == "mps":
+        return "mps (Apple Metal)"
+    return "cpu"
+
+
+def count_trainable_params(model: nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def log_model_details(model: nn.Module, backbone: str) -> None:
+    trainable_params = count_trainable_params(model)
+    total_params = sum(p.numel() for p in model.parameters())
+    logger.info(
+        "Model backbone: %s | Trainable params: %d | Total params: %d",
+        backbone,
+        trainable_params,
+        total_params,
+    )
 
 
 # ========================
@@ -112,6 +139,7 @@ def train_one_backbone(
     pretrained_backbone=None,
 ):
     device = get_device()
+    logger.info("Training device: %s", describe_device(device))
 
     # transforms
     transform = build_transforms(img_size)
@@ -127,6 +155,8 @@ def train_one_backbone(
 
     for p in model.parameters():
         p.requires_grad = True
+
+    log_model_details(model, backbone)
 
     # loss & optimizer
     criterion = nn.BCEWithLogitsLoss()
@@ -225,12 +255,14 @@ def predict_from_images(
     num_classes=3,
 ):
     device = get_device()
+    logger.info("Prediction device: %s", describe_device(device))
     transform = build_transforms(img_size)
 
     predict_ds = RetinaPredictDataset(image_csv, image_dir, transform)
     predict_loader = DataLoader(predict_ds, batch_size=batch_size, shuffle=False, num_workers=4)
 
     model = build_model(backbone, num_classes=num_classes, pretrained=False).to(device)
+    log_model_details(model, backbone)
     load_checkpoint(model, checkpoint_path, device)
     model.eval()
 
@@ -283,6 +315,28 @@ class RunnerConfig:
 
 
 def run_pipeline(config: RunnerConfig):
+    enabled_stages = []
+    if config.do_train:
+        enabled_stages.append("train")
+    if config.do_test:
+        enabled_stages.append("test")
+    if config.do_predict:
+        enabled_stages.append("predict")
+
+    if config.do_train and config.do_predict:
+        mode = "train & predict"
+    elif (not config.do_train) and config.do_predict:
+        mode = "predict only"
+    elif enabled_stages:
+        mode = " & ".join(enabled_stages)
+    else:
+        mode = "none"
+
+    device = get_device()
+    logger.info("Run mode: %s", mode)
+    logger.info("Selected device: %s", describe_device(device))
+    logger.info("Backbone: %s", config.backbone)
+
     checkpoint_path = config.checkpoint_path
     if config.do_train:
         checkpoint_path = train_one_backbone(
@@ -305,11 +359,11 @@ def run_pipeline(config: RunnerConfig):
         checkpoint_path = config.pretrained_backbone
 
     if config.do_test:
-        device = get_device()
         transform = build_transforms(config.img_size)
         test_ds = RetinaMultiLabelDataset(config.test_csv, config.test_image_dir, transform)
         test_loader = DataLoader(test_ds, batch_size=config.batch_size, shuffle=False, num_workers=4)
         model = build_model(config.backbone, num_classes=config.num_classes, pretrained=False).to(device)
+        log_model_details(model, config.backbone)
         load_checkpoint(model, checkpoint_path, device)
         evaluate_model(model, test_loader, device, config.backbone)
 
