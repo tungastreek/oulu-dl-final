@@ -97,7 +97,7 @@ class RetinaPredictDataset(Dataset):
 # ========================
 # build model
 # ========================
-def build_model(backbone="resnet18", num_classes=3, pretrained=True):
+def build_model(backbone, num_classes, pretrained):
     if backbone == "resnet18":
         model = models.resnet18(pretrained=pretrained)
         model.fc = nn.Linear(model.fc.in_features, num_classes)
@@ -128,6 +128,7 @@ def load_checkpoint(model, checkpoint_path, device):
 def train_one_backbone(
     backbone,
     tuning_method,
+    num_classes,
     train_csv,
     val_csv,
     train_image_dir,
@@ -155,7 +156,7 @@ def train_one_backbone(
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
     # model
-    model = build_model(backbone, num_classes=3, pretrained=False).to(device)
+    model = build_model(backbone, num_classes=num_classes, pretrained=False).to(device)
 
     for p in model.parameters():
         p.requires_grad = False
@@ -270,9 +271,9 @@ def predict_from_images(
     image_csv,
     image_dir,
     output_csv,
-    img_size=256,
-    batch_size=32,
-    num_classes=3,
+    img_size,
+    batch_size,
+    num_classes,
 ):
     device = get_device()
     logger.info("Prediction device: %s", describe_device(device))
@@ -366,6 +367,7 @@ def run_pipeline(config: RunnerConfig):
         checkpoint_path = train_one_backbone(
             backbone=config.backbone,
             tuning_method=config.tuning_method,
+            num_classes=config.num_classes,
             train_csv=config.train_csv,
             val_csv=config.val_csv,
             train_image_dir=config.train_image_dir,
@@ -416,17 +418,6 @@ def run_pipeline(config: RunnerConfig):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train/test/predict retina models.")
     parser.add_argument("--config", type=str, help="Path to JSON config file.")
-    parser.add_argument("--do-train", action="store_true", help="Enable training.")
-    parser.add_argument("--no-train", action="store_true", help="Disable training.")
-    parser.add_argument("--do-test", action="store_true", help="Enable testing.")
-    parser.add_argument("--no-test", action="store_true", help="Disable testing.")
-    parser.add_argument("--do-predict", action="store_true", help="Enable prediction.")
-    parser.add_argument("--no-predict", action="store_true", help="Disable prediction.")
-    parser.add_argument("--checkpoint-path", type=str, help="Path to a checkpoint to load.")
-    parser.add_argument("--pretrained-backbone", type=str, help="Path to pretrained backbone weights.")
-    parser.add_argument("--predict-input-csv", type=str, help="CSV listing images to predict.")
-    parser.add_argument("--predict-image-dir", type=str, help="Directory containing prediction images.")
-    parser.add_argument("--predict-output-csv", type=str, help="Output CSV path for predictions.")
     args = parser.parse_args()
 
     config_data: Dict[str, Any] = {}
@@ -435,29 +426,5 @@ if __name__ == "__main__":
             config_data = json.load(handle)
 
     config = RunnerConfig.from_dict(config_data)
-
-    if args.checkpoint_path:
-        config.checkpoint_path = args.checkpoint_path
-    if args.pretrained_backbone:
-        config.pretrained_backbone = args.pretrained_backbone
-    if args.predict_input_csv:
-        config.predict_input_csv = args.predict_input_csv
-    if args.predict_image_dir:
-        config.predict_image_dir = args.predict_image_dir
-    if args.predict_output_csv:
-        config.predict_output_csv = args.predict_output_csv
-
-    if args.do_train:
-        config.do_train = True
-    if args.no_train:
-        config.do_train = False
-    if args.do_test:
-        config.do_test = True
-    if args.no_test:
-        config.do_test = False
-    if args.do_predict:
-        config.do_predict = True
-    if args.no_predict:
-        config.do_predict = False
 
     run_pipeline(config)
