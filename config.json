@@ -1,0 +1,23 @@
+{
+  "backbone": "resnet18",
+  "num_classes": 3,
+  "train_csv": "train.csv",
+  "val_csv": "val.csv",
+  "test_csv": "offsite_test.csv",
+  "train_image_dir": "./images/train",
+  "val_image_dir": "./images/val",
+  "test_image_dir": "./images/offsite_test",
+  "epochs": 20,
+  "batch_size": 32,
+  "lr": 1e-5,
+  "img_size": 256,
+  "save_dir": "checkpoints",
+  "pretrained_backbone": "./pretrained_backbone/ckpt_resnet18_ep50.pt",
+  "checkpoint_path": null,
+  "do_train": true,
+  "do_test": true,
+  "do_predict": false,
+  "predict_input_csv": "./predict.csv",
+  "predict_image_dir": "./images/predict",
+  "predict_output_csv": "predictions.csv"
+}
