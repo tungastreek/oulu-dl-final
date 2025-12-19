@@ -1,0 +1,4 @@
+.DS_Store
+images/
+pretrained_backbone/
+onsite_test_submission.csv
