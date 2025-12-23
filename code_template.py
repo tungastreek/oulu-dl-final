@@ -2,6 +2,7 @@ import argparse
 import json
 import logging
 import os
+import random
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -117,6 +118,75 @@ def build_transforms(img_size):
     ])
 
 
+def count_class_occurrences(dataframe: pd.DataFrame) -> Dict[str, int]:
+    return {disease: int(dataframe[disease].sum()) for disease in DISEASE_NAMES}
+
+
+def balance_training_data(
+    train_csv: str,
+    train_image_dir: str,
+    classes_to_balance: tuple = ("G", "A"),
+    random_seed: int = 42,
+) -> None:
+    dataframe = pd.read_csv(train_csv)
+    counts = count_class_occurrences(dataframe)
+    logger.info("Training set counts before balancing: %s", counts)
+
+    target_count = max(counts.values()) if counts else 0
+    if target_count == 0:
+        logger.warning("Training set appears to be empty; skipping balancing.")
+        return
+
+    rng = random.Random(random_seed)
+    existing_ids = set(dataframe["id"].tolist())
+    new_rows = []
+
+    for disease in classes_to_balance:
+        current_count = counts.get(disease, 0)
+        deficit = target_count - current_count
+        if deficit <= 0:
+            continue
+        candidates = dataframe[dataframe[disease] == 1]
+        if candidates.empty:
+            logger.warning("No candidate images found for class %s; skipping.", disease)
+            continue
+        for index in range(deficit):
+            row = candidates.iloc[rng.randrange(len(candidates))]
+            image_name = row["id"]
+            image_path = os.path.join(train_image_dir, image_name)
+            if not os.path.exists(image_path):
+                logger.warning("Missing image %s; skipping augmentation.", image_path)
+                continue
+            image = Image.open(image_path).convert("RGB")
+            flip_type = rng.choice(["h", "v"])
+            if flip_type == "h":
+                image = image.transpose(Image.FLIP_LEFT_RIGHT)
+            else:
+                image = image.transpose(Image.FLIP_TOP_BOTTOM)
+
+            base, ext = os.path.splitext(image_name)
+            counter = index
+            new_name = f"{base}_flip_{flip_type}_{counter}{ext}"
+            while new_name in existing_ids or os.path.exists(os.path.join(train_image_dir, new_name)):
+                counter += 1
+                new_name = f"{base}_flip_{flip_type}_{counter}{ext}"
+
+            image.save(os.path.join(train_image_dir, new_name))
+            existing_ids.add(new_name)
+            new_row = row.copy()
+            new_row["id"] = new_name
+            new_rows.append(new_row)
+
+    if new_rows:
+        dataframe = pd.concat([dataframe, pd.DataFrame(new_rows)], ignore_index=True)
+        dataframe = dataframe[["id"] + DISEASE_NAMES]
+        dataframe.to_csv(train_csv, index=False)
+        counts_after = count_class_occurrences(dataframe)
+        logger.info("Training set counts after balancing: %s", counts_after)
+    else:
+        logger.info("No balancing required; training set already balanced.")
+
+
 def load_checkpoint(model, checkpoint_path, device):
     state_dict = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(state_dict)
@@ -145,6 +215,8 @@ def train_one_backbone(
 ):
     device = get_device()
     logger.info("Training device: %s", describe_device(device))
+
+    balance_training_data(train_csv, train_image_dir)
 
     # transforms
     transform = build_transforms(img_size)
