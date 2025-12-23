@@ -2,6 +2,7 @@ import argparse
 import json
 import logging
 import os
+import random
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -117,6 +118,80 @@ def build_transforms(img_size):
     ])
 
 
+def count_class_occurrences(dataframe: pd.DataFrame) -> Dict[str, int]:
+    return {disease: int(dataframe[disease].sum()) for disease in DISEASE_NAMES}
+
+
+def balance_training_data(
+    train_csv: str,
+    train_image_dir: str,
+    classes_to_balance: tuple = ("G", "A"),
+    random_seed: int = 42,
+) -> Dict[str, Any]:
+    original_dataframe = pd.read_csv(train_csv)
+    counts = count_class_occurrences(original_dataframe)
+    logger.info("Training set counts before balancing: %s", counts)
+
+    target_count = max(counts.values()) if counts else 0
+    if target_count == 0:
+        logger.warning("Training set appears to be empty; skipping balancing.")
+        return {"original_df": original_dataframe, "new_files": []}
+
+    rng = random.Random(random_seed)
+    existing_ids = set(original_dataframe["id"].tolist())
+    new_rows = []
+    new_files = []
+
+    for disease in classes_to_balance:
+        current_count = counts.get(disease, 0)
+        deficit = target_count - current_count
+        if deficit <= 0:
+            continue
+        candidates = original_dataframe[original_dataframe[disease] == 1]
+        if candidates.empty:
+            logger.warning("No candidate images found for class %s; skipping.", disease)
+            continue
+        for index in range(deficit):
+            row = candidates.iloc[rng.randrange(len(candidates))]
+            image_name = row["id"]
+            image_path = os.path.join(train_image_dir, image_name)
+            if not os.path.exists(image_path):
+                logger.warning("Missing image %s; skipping augmentation.", image_path)
+                continue
+            image = Image.open(image_path).convert("RGB")
+            flip_type = rng.choice(["h", "v"])
+            if flip_type == "h":
+                image = image.transpose(Image.FLIP_LEFT_RIGHT)
+            else:
+                image = image.transpose(Image.FLIP_TOP_BOTTOM)
+
+            base, ext = os.path.splitext(image_name)
+            counter = index
+            new_name = f"{base}_flip_{flip_type}_{counter}{ext}"
+            while new_name in existing_ids or os.path.exists(os.path.join(train_image_dir, new_name)):
+                counter += 1
+                new_name = f"{base}_flip_{flip_type}_{counter}{ext}"
+
+            new_path = os.path.join(train_image_dir, new_name)
+            image.save(new_path)
+            existing_ids.add(new_name)
+            new_row = row.copy()
+            new_row["id"] = new_name
+            new_rows.append(new_row)
+            new_files.append(new_path)
+
+    if new_rows:
+        augmented = pd.concat([original_dataframe, pd.DataFrame(new_rows)], ignore_index=True)
+        augmented = augmented[["id"] + DISEASE_NAMES]
+        augmented.to_csv(train_csv, index=False)
+        counts_after = count_class_occurrences(augmented)
+        logger.info("Training set counts after balancing: %s", counts_after)
+    else:
+        logger.info("No balancing required; training set already balanced.")
+
+    return {"original_df": original_dataframe, "new_files": new_files}
+
+
 def load_checkpoint(model, checkpoint_path, device):
     state_dict = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(state_dict)
@@ -145,6 +220,8 @@ def train_one_backbone(
 ):
     device = get_device()
     logger.info("Training device: %s", describe_device(device))
+
+    balancing_result = balance_training_data(train_csv, train_image_dir)
 
     # transforms
     transform = build_transforms(img_size)
@@ -185,45 +262,54 @@ def train_one_backbone(
     if pretrained_backbone is not None:
         load_checkpoint(model, pretrained_backbone, device)
 
-    initial_patience = 0
-    for epoch in range(epochs):
-        model.train()
-        train_loss = 0
-        for imgs, labels in train_loader:
-            imgs, labels = imgs.to(device), labels.to(device)
-            optimizer.zero_grad()
-            outputs = model(imgs)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item() * imgs.size(0)
-
-        train_loss /= len(train_loader.dataset)
-
-        # validation
-        model.eval()
-        val_loss = 0
-        with torch.no_grad():
-            for imgs, labels in val_loader:
+    try:
+        initial_patience = 0
+        for epoch in range(epochs):
+            model.train()
+            train_loss = 0
+            for imgs, labels in train_loader:
                 imgs, labels = imgs.to(device), labels.to(device)
+                optimizer.zero_grad()
                 outputs = model(imgs)
                 loss = criterion(outputs, labels)
-                val_loss += loss.item() * imgs.size(0)
-        val_loss /= len(val_loader.dataset)
+                loss.backward()
+                optimizer.step()
+                train_loss += loss.item() * imgs.size(0)
 
-        print(f"[{backbone}] Epoch {epoch + 1}/{epochs} Train Loss: {train_loss:.4f} Val Loss: {val_loss:.4f}")
+            train_loss /= len(train_loader.dataset)
 
-        # save best
-        if val_loss < best_val_loss:
-            initial_patience = 0
-            best_val_loss = val_loss
-            torch.save(model.state_dict(), ckpt_path)
-            print(f"Saved best model for {backbone} at {ckpt_path}")
-        else:
-            initial_patience += 1
-            if initial_patience >= early_stopping_patience:
-                print(f"Early stopping at epoch {epoch + 1} for {backbone}")
-                break
+            # validation
+            model.eval()
+            val_loss = 0
+            with torch.no_grad():
+                for imgs, labels in val_loader:
+                    imgs, labels = imgs.to(device), labels.to(device)
+                    outputs = model(imgs)
+                    loss = criterion(outputs, labels)
+                    val_loss += loss.item() * imgs.size(0)
+            val_loss /= len(val_loader.dataset)
+
+            print(f"[{backbone}] Epoch {epoch + 1}/{epochs} Train Loss: {train_loss:.4f} Val Loss: {val_loss:.4f}")
+
+            # save best
+            if val_loss < best_val_loss:
+                initial_patience = 0
+                best_val_loss = val_loss
+                torch.save(model.state_dict(), ckpt_path)
+                print(f"Saved best model for {backbone} at {ckpt_path}")
+            else:
+                initial_patience += 1
+                if initial_patience >= early_stopping_patience:
+                    print(f"Early stopping at epoch {epoch + 1} for {backbone}")
+                    break
+    finally:
+        original_df = balancing_result.get("original_df")
+        new_files = balancing_result.get("new_files", [])
+        if original_df is not None:
+            original_df.to_csv(train_csv, index=False)
+        for file_path in new_files:
+            if os.path.exists(file_path):
+                os.remove(file_path)
 
     return ckpt_path
 
