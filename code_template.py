@@ -58,24 +58,39 @@ def log_model_details(model: nn.Module, backbone: str) -> None:
 # Custom Loss Functions
 # =======================
 class FocalLoss(nn.Module):
-    def __init__(self, alpha: float=1, gamma:float=2, reduction="mean"):
-        super(FocalLoss, self).__init__()
+    def __init__(self, alpha=0.2, gamma=2.0, reduction="mean"):
+        super().__init__()
         self.alpha = alpha
-        self.gamma = gamma
+        self.gamma = float(gamma)
         self.reduction = reduction
 
-    def forward(self, inputs, targets):
-        bce_loss = nn.functional.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
-        probs = torch.sigmoid(inputs)
-        p_t = targets * probs + (1 - targets) * (1 - probs)
-        focal_loss = self.alpha * (1 - p_t) ** self.gamma * bce_loss
+    def _alpha_tensor(self, inputs: torch.Tensor) -> torch.Tensor:
+        if isinstance(self.alpha, (list, tuple)):
+            a = torch.tensor(self.alpha, dtype=inputs.dtype, device=inputs.device)
+            return a.view(1, -1)
+        if torch.is_tensor(self.alpha):
+            return self.alpha.to(device=inputs.device, dtype=inputs.dtype).view(1, -1)
+        return torch.tensor(float(self.alpha), dtype=inputs.dtype, device=inputs.device)
+
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        targets = targets.to(dtype=inputs.dtype, device=inputs.device)
+
+        bce = nn.functional.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+        p = torch.sigmoid(inputs)
+        p_t = targets * p + (1.0 - targets) * (1.0 - p)
+
+        alpha = self._alpha_tensor(inputs)
+        alpha_t = targets * alpha + (1.0 - targets) * (1.0 - alpha)
+
+        loss = alpha_t * (1.0 - p_t).pow(self.gamma) * bce
 
         if self.reduction == "mean":
-            return focal_loss.mean()
-        elif self.reduction == "sum":
-            return focal_loss.sum()
-        else:
-            return focal_loss
+            return loss.mean()
+        if self.reduction == "sum":
+            return loss.sum()
+        if self.reduction == "none":
+            return loss
+        raise ValueError("reduction must be one of: 'mean', 'sum', 'none'")
 
 
 # ========================
@@ -212,7 +227,7 @@ def train_one_backbone(
     if loss_function == "bce":
         criterion = nn.BCEWithLogitsLoss()
     elif loss_function == "focal":
-        criterion = FocalLoss(alpha=0.6)
+        criterion = FocalLoss(alpha=[0.35, 0.8, 0.8], gamma=2)
     else:
         raise ValueError("Unsupported loss function")
     if weight_decay != 0:
