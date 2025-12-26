@@ -58,19 +58,10 @@ def log_model_details(model: nn.Module, backbone: str) -> None:
 # Custom Loss Functions
 # =======================
 class FocalLoss(nn.Module):
-    def __init__(self, alpha=0.2, gamma=2.0, reduction="mean"):
+    def __init__(self, alpha, gamma):
         super().__init__()
         self.alpha = alpha
         self.gamma = float(gamma)
-        self.reduction = reduction
-
-    def _alpha_tensor(self, inputs: torch.Tensor) -> torch.Tensor:
-        if isinstance(self.alpha, (list, tuple)):
-            a = torch.tensor(self.alpha, dtype=inputs.dtype, device=inputs.device)
-            return a.view(1, -1)
-        if torch.is_tensor(self.alpha):
-            return self.alpha.to(device=inputs.device, dtype=inputs.dtype).view(1, -1)
-        return torch.tensor(float(self.alpha), dtype=inputs.dtype, device=inputs.device)
 
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         targets = targets.to(dtype=inputs.dtype, device=inputs.device)
@@ -78,19 +69,10 @@ class FocalLoss(nn.Module):
         bce = nn.functional.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
         p = torch.sigmoid(inputs)
         p_t = targets * p + (1.0 - targets) * (1.0 - p)
-
-        alpha = self._alpha_tensor(inputs)
-        alpha_t = targets * alpha + (1.0 - targets) * (1.0 - alpha)
-
+        alpha_t = targets * self.alpha + (1.0 - targets) * (1.0 - self.alpha)
         loss = alpha_t * (1.0 - p_t).pow(self.gamma) * bce
 
-        if self.reduction == "mean":
-            return loss.mean()
-        if self.reduction == "sum":
-            return loss.sum()
-        if self.reduction == "none":
-            return loss
-        raise ValueError("reduction must be one of: 'mean', 'sum', 'none'")
+        return loss.mean()
 
 
 # ========================
@@ -191,7 +173,6 @@ def train_one_backbone(
     img_size,
     save_dir,
     pretrained_backbone,
-    save_best_by
 ):
     device = get_device()
     # run_pipeline() already logs device at INFO; keep this non-redundant
@@ -205,6 +186,19 @@ def train_one_backbone(
     val_ds = RetinaMultiLabelDataset(val_csv, val_image_dir, transform)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+
+    # calculate class weights based on train_csv
+    train_df = pd.read_csv(train_csv)
+    pos = train_df.iloc[:, 1:].sum(axis=0).to_numpy(dtype=np.float32)
+    n = float(len(train_df))
+    neg = (n - pos).astype(np.float32)
+
+    eps = 1e-6
+    pos_weight = torch.tensor(neg / (pos + eps), dtype=torch.float32, device=device).clamp(min=0.0)  # wbce
+    focal_alpha = torch.tensor(neg / (n + eps), dtype=torch.float32, device=device).clamp(0.0, 1.0)  # focal
+
+    logger.info("pos_weight (wbce) D,G,A: %s", pos_weight.detach().cpu().numpy().round(4).tolist())
+    logger.info("alpha (focal)     D,G,A: %s", focal_alpha.detach().cpu().numpy().round(4).tolist())
 
     # model
     model = build_model(backbone, num_classes=num_classes, pretrained=False).to(device)
@@ -227,7 +221,9 @@ def train_one_backbone(
     if loss_function == "bce":
         criterion = nn.BCEWithLogitsLoss()
     elif loss_function == "focal":
-        criterion = FocalLoss(alpha=[0.35, 0.8, 0.8], gamma=2)
+        criterion = FocalLoss(alpha=focal_alpha, gamma=2)
+    elif loss_function == "wbce":
+        criterion = nn.BCEWithLogitsLoss(reduction="mean", pos_weight=pos_weight)
     else:
         raise ValueError("Unsupported loss function")
     if weight_decay != 0:
@@ -239,14 +235,14 @@ def train_one_backbone(
     os.makedirs(save_dir, exist_ok=True)
     ckpt_path = os.path.join(save_dir, f"best_{backbone}.pt")
 
-    # loss: lower is better. f1: higher is better.
-    best_score = float("inf") if save_best_by == "loss" else float("-inf")
+    # f1: higher is better.
+    best_f1 = float("-inf")
 
     # load pretrained backbone
     if pretrained_backbone is not None:
         load_checkpoint(model, pretrained_backbone, device)
 
-    initial_patience = 0
+    no_improve_patience = 0
     for epoch in range(epochs):
         model.train()
         train_loss = 0
@@ -294,19 +290,21 @@ def train_one_backbone(
             val_f1_macro,
         )
 
-        current_score = val_loss if save_best_by == "loss" else val_f1_macro
-        is_improved = (current_score < best_score) if save_best_by == "loss" else (current_score > best_score)
-
-        # save best
-        if is_improved:
-            initial_patience = 0
-            best_score = current_score
+        # save best-by-f1 (single checkpoint)
+        if val_f1_macro > best_f1:
+            best_f1 = val_f1_macro
             torch.save(model.state_dict(), ckpt_path)
-            logger.info("Saved best model for %s by %s at %s", backbone, save_best_by, ckpt_path)
+            logger.info("Saved best-by-f1 model for %s at %s (val_f1=%.4f)", backbone, ckpt_path, val_f1_macro)
+            no_improve_patience = 0
         else:
-            initial_patience += 1
-            if initial_patience >= early_stopping_patience:
-                logger.info("Early stopping at epoch %d for %s", epoch + 1, backbone)
+            no_improve_patience += 1
+            if no_improve_patience >= early_stopping_patience:
+                logger.info(
+                    "Early stopping at epoch %d for %s (no improvement in val macro-F1 for %d epochs)",
+                    epoch + 1,
+                    backbone,
+                    early_stopping_patience,
+                )
                 break
 
     return ckpt_path
@@ -395,7 +393,6 @@ class RunnerConfig:
     num_classes: int = 3
     tuning_method: str = "full"
     loss_function: str = "bce"
-    save_best_by: str = "loss"
     train_csv: str = "train.csv"
     val_csv: str = "val.csv"
     test_csv: str = "offsite_test.csv"
@@ -469,7 +466,6 @@ def run_pipeline(config: RunnerConfig):
             img_size=config.img_size,
             save_dir=config.save_dir,
             pretrained_backbone=config.pretrained_backbone,
-            save_best_by=config.save_best_by
         )
     elif checkpoint_path is None and config.pretrained_backbone is None:
         raise ValueError("Provide checkpoint_path or pretrained_backbone when training is disabled.")

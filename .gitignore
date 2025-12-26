@@ -2,4 +2,5 @@
 images/
 pretrained_backbone/
 checkpoints/
-onsite_test_submission.csv
+onsite_test_submission*.csv
+*.pyc
