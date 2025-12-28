@@ -58,24 +58,68 @@ def log_model_details(model: nn.Module, backbone: str) -> None:
 # Custom Loss Functions
 # =======================
 class FocalLoss(nn.Module):
-    def __init__(self, alpha: float=1, gamma:float=2, reduction="mean"):
-        super(FocalLoss, self).__init__()
+    def __init__(self, alpha, gamma):
+        super().__init__()
         self.alpha = alpha
-        self.gamma = gamma
-        self.reduction = reduction
+        self.gamma = float(gamma)
 
-    def forward(self, inputs, targets):
-        bce_loss = nn.functional.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
-        probs = torch.sigmoid(inputs)
-        p_t = targets * probs + (1 - targets) * (1 - probs)
-        focal_loss = self.alpha * (1 - p_t) ** self.gamma * bce_loss
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        targets = targets.to(dtype=inputs.dtype, device=inputs.device)
 
-        if self.reduction == "mean":
-            return focal_loss.mean()
-        elif self.reduction == "sum":
-            return focal_loss.sum()
-        else:
-            return focal_loss
+        bce = nn.functional.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+        p = torch.sigmoid(inputs)
+        p_t = targets * p + (1.0 - targets) * (1.0 - p)
+        alpha_t = targets * self.alpha + (1.0 - targets) * (1.0 - self.alpha)
+        loss = alpha_t * (1.0 - p_t).pow(self.gamma) * bce
+
+        return loss.mean()
+
+
+# ============================
+# Custom Attention Mechanisms
+# ============================
+class SE(nn.Module):
+    def __init__(self, channel, reduction_ratio=16):
+        super().__init__()
+        hidden = max(1, channel // reduction_ratio)
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.mlp = nn.Sequential(
+            nn.Linear(channel, hidden, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, channel, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.gap(x).view(b, c)
+        y = self.mlp(y).view(b, c, 1, 1)
+        return x * y
+    
+
+class MHA(nn.Module):
+    def __init__(self, embed_dim, num_heads):
+        super().__init__()
+        self.mha = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads, batch_first=True)
+
+    def forward(self, x):
+        b, c, h, w = x.size()
+        x_reshaped = x.view(b, c, h * w).permute(0, 2, 1)
+        attn_output, _ = self.mha(x_reshaped, x_reshaped, x_reshaped)
+        attn_output = attn_output.permute(0, 2, 1).view(b, c, h, w)
+        return attn_output
+
+
+class AttnThenPool(nn.Module):
+    def __init__(self, attn: nn.Module, pool: nn.Module):
+        super().__init__()
+        self.attn = attn
+        self.pool = pool
+
+    def forward(self, x):
+        x = self.attn(x)
+        x = self.pool(x)
+        return x
 
 
 # ========================
@@ -122,21 +166,52 @@ class RetinaPredictDataset(Dataset):
 # ========================
 # build model
 # ========================
-def build_model(backbone, num_classes, pretrained):
+def build_model(backbone, num_classes, pretrained, attention):
+    # resnet18
     if backbone == "resnet18":
+        # weights
         if pretrained:
             weights = models.ResNet18_Weights.DEFAULT
         else:
             weights = None
         model = models.resnet18(weights=weights)
+        # head
         model.fc = nn.Linear(model.fc.in_features, num_classes)
+        # attention
+        if attention != "none":
+            if attention == "se":
+                attn = SE(channel=512, reduction_ratio=16)
+            elif attention == "mha":
+                attn = MHA(embed_dim=512, num_heads=8)
+            else:
+                raise ValueError("Unsupported attention mechanism")
+            model.avgpool = AttnThenPool(attn, model.avgpool)
+
+    # efficientnet
     elif backbone == "efficientnet":
+        # weights
         if pretrained:
             weights = models.EfficientNet_B0_Weights.DEFAULT
         else:
             weights = None
         model = models.efficientnet_b0(weights=weights)
+        # head
         model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
+        # attention
+        if attention != "none":
+            raise ValueError("Attention mechanisms not supported for EfficientNet backbone")
+
+    # Swin Transformer
+    elif backbone == "swin":
+        # weights
+        weights = models.Swin_V2_T_Weights.IMAGENET1K_V1
+        model = models.swin_v2_t(weights=weights)
+        # head
+        model.head = nn.Linear(model.head.in_features, num_classes)
+        # attention
+        if attention != "none":
+            raise ValueError("Attention mechanisms not supported for Swin Transformer backbone")
+
     else:
         raise ValueError("Unsupported backbone")
     return model
@@ -150,9 +225,9 @@ def build_transforms(img_size):
     ])
 
 
-def load_checkpoint(model, checkpoint_path, device):
+def load_checkpoint(model, checkpoint_path, device, strict):
     state_dict = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(state_dict)
+    model.load_state_dict(state_dict, strict=strict)
 
 
 # ========================
@@ -162,6 +237,7 @@ def train_one_backbone(
     backbone,
     tuning_method,
     loss_function,
+    attention,
     num_classes,
     train_csv,
     val_csv,
@@ -176,7 +252,6 @@ def train_one_backbone(
     img_size,
     save_dir,
     pretrained_backbone,
-    save_best_by
 ):
     device = get_device()
     # run_pipeline() already logs device at INFO; keep this non-redundant
@@ -191,8 +266,21 @@ def train_one_backbone(
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
+    # calculate class weights based on train_csv
+    train_df = pd.read_csv(train_csv)
+    pos = train_df.iloc[:, 1:].sum(axis=0).to_numpy(dtype=np.float32)
+    n = float(len(train_df))
+    neg = (n - pos).astype(np.float32)
+
+    eps = 1e-6
+    pos_weight = torch.tensor(neg / (pos + eps), dtype=torch.float32, device=device).clamp(min=0.0)  # wbce
+    focal_alpha = torch.tensor(neg / (n + eps), dtype=torch.float32, device=device).clamp(0.0, 1.0)  # focal
+
+    logger.info("pos_weight (wbce) D,G,A: %s", pos_weight.detach().cpu().numpy().round(4).tolist())
+    logger.info("alpha (focal)     D,G,A: %s", focal_alpha.detach().cpu().numpy().round(4).tolist())
+
     # model
-    model = build_model(backbone, num_classes=num_classes, pretrained=False).to(device)
+    model = build_model(backbone, num_classes=num_classes, pretrained=False, attention=attention).to(device)
 
     for p in model.parameters():
         p.requires_grad = False
@@ -203,6 +291,9 @@ def train_one_backbone(
         elif backbone == "efficientnet":
             for p in model.classifier.parameters():
                 p.requires_grad = True
+        elif backbone == "swin":
+            for p in model.head.parameters():
+                p.requires_grad = True
     elif tuning_method == "full":
         for p in model.parameters():
             p.requires_grad = True
@@ -212,7 +303,9 @@ def train_one_backbone(
     if loss_function == "bce":
         criterion = nn.BCEWithLogitsLoss()
     elif loss_function == "focal":
-        criterion = FocalLoss(alpha=0.6)
+        criterion = FocalLoss(alpha=focal_alpha, gamma=2)
+    elif loss_function == "wbce":
+        criterion = nn.BCEWithLogitsLoss(reduction="mean", pos_weight=pos_weight)
     else:
         raise ValueError("Unsupported loss function")
     if weight_decay != 0:
@@ -224,14 +317,13 @@ def train_one_backbone(
     os.makedirs(save_dir, exist_ok=True)
     ckpt_path = os.path.join(save_dir, f"best_{backbone}.pt")
 
-    # loss: lower is better. f1: higher is better.
-    best_score = float("inf") if save_best_by == "loss" else float("-inf")
+    best_f1 = float("-inf")
 
     # load pretrained backbone
     if pretrained_backbone is not None:
-        load_checkpoint(model, pretrained_backbone, device)
+        load_checkpoint(model, pretrained_backbone, device, strict=(attention == "none"))
 
-    initial_patience = 0
+    no_improve_patience = 0
     for epoch in range(epochs):
         model.train()
         train_loss = 0
@@ -279,19 +371,21 @@ def train_one_backbone(
             val_f1_macro,
         )
 
-        current_score = val_loss if save_best_by == "loss" else val_f1_macro
-        is_improved = (current_score < best_score) if save_best_by == "loss" else (current_score > best_score)
-
-        # save best
-        if is_improved:
-            initial_patience = 0
-            best_score = current_score
+        # save best-by-f1 (single checkpoint)
+        if val_f1_macro > best_f1:
+            best_f1 = val_f1_macro
             torch.save(model.state_dict(), ckpt_path)
-            logger.info("Saved best model for %s by %s at %s", backbone, save_best_by, ckpt_path)
+            logger.info("Saved best-by-f1 model for %s at %s (val_f1=%.4f)", backbone, ckpt_path, val_f1_macro)
+            no_improve_patience = 0
         else:
-            initial_patience += 1
-            if initial_patience >= early_stopping_patience:
-                logger.info("Early stopping at epoch %d for %s", epoch + 1, backbone)
+            no_improve_patience += 1
+            if no_improve_patience >= early_stopping_patience:
+                logger.info(
+                    "Early stopping at epoch %d for %s (no improvement in val macro-F1 for %d epochs)",
+                    epoch + 1,
+                    backbone,
+                    early_stopping_patience,
+                )
                 break
 
     return ckpt_path
@@ -352,9 +446,9 @@ def predict_from_images(
     predict_ds = RetinaPredictDataset(image_csv, image_dir, transform)
     predict_loader = DataLoader(predict_ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
-    model = build_model(backbone, num_classes=num_classes, pretrained=False).to(device)
+    model = build_model(backbone, num_classes=num_classes, pretrained=False, attention=config.attention).to(device)
     log_model_details(model, backbone)
-    load_checkpoint(model, checkpoint_path, device)
+    load_checkpoint(model, checkpoint_path, device, strict=(config.attention=="none"))
     model.eval()
 
     results = []
@@ -380,7 +474,7 @@ class RunnerConfig:
     num_classes: int = 3
     tuning_method: str = "full"
     loss_function: str = "bce"
-    save_best_by: str = "loss"
+    attention: str = "none"
     train_csv: str = "train.csv"
     val_csv: str = "val.csv"
     test_csv: str = "offsite_test.csv"
@@ -440,6 +534,7 @@ def run_pipeline(config: RunnerConfig):
             backbone=config.backbone,
             tuning_method=config.tuning_method,
             loss_function=config.loss_function,
+            attention=config.attention,
             num_classes=config.num_classes,
             train_csv=config.train_csv,
             val_csv=config.val_csv,
@@ -454,7 +549,6 @@ def run_pipeline(config: RunnerConfig):
             img_size=config.img_size,
             save_dir=config.save_dir,
             pretrained_backbone=config.pretrained_backbone,
-            save_best_by=config.save_best_by
         )
     elif checkpoint_path is None and config.pretrained_backbone is None:
         raise ValueError("Provide checkpoint_path or pretrained_backbone when training is disabled.")
@@ -466,9 +560,9 @@ def run_pipeline(config: RunnerConfig):
         transform = build_transforms(config.img_size)
         test_ds = RetinaMultiLabelDataset(config.test_csv, config.test_image_dir, transform)
         test_loader = DataLoader(test_ds, batch_size=config.batch_size, shuffle=False, num_workers=0)
-        model = build_model(config.backbone, num_classes=config.num_classes, pretrained=False).to(device)
+        model = build_model(config.backbone, num_classes=config.num_classes, pretrained=False, attention=config.attention).to(device)
         log_model_details(model, config.backbone)
-        load_checkpoint(model, checkpoint_path, device)
+        load_checkpoint(model, checkpoint_path, device, strict=(config.attention=="none"))
         evaluate_model(model, test_loader, device, config.backbone)
 
     if config.do_predict:
