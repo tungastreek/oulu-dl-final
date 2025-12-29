@@ -204,7 +204,7 @@ def build_model(backbone, num_classes, pretrained, attention):
     # Swin Transformer
     elif backbone == "swin":
         # weights
-        weights = models.Swin_V2_T_Weights.IMAGENET1K_V1
+        weights = models.Swin_V2_T_Weights.DEFAULT
         model = models.swin_v2_t(weights=weights)
         # head
         model.head = nn.Linear(model.head.in_features, num_classes)
@@ -238,6 +238,7 @@ def train_one_backbone(
     tuning_method,
     loss_function,
     attention,
+    label_smoothing_epsilon,
     num_classes,
     train_csv,
     val_csv,
@@ -329,6 +330,10 @@ def train_one_backbone(
         train_loss = 0
         for imgs, labels in train_loader:
             imgs, labels = imgs.to(device), labels.to(device)
+            # label smoothing
+            if label_smoothing_epsilon > 0.0:
+                labels_smoothed = labels * (1.0 - label_smoothing_epsilon) + (1.0 - labels) * label_smoothing_epsilon 
+                labels = labels_smoothed
             optimizer.zero_grad()
             outputs = model(imgs)
             loss = criterion(outputs, labels)
@@ -475,6 +480,7 @@ class RunnerConfig:
     tuning_method: str = "full"
     loss_function: str = "bce"
     attention: str = "none"
+    label_smoothing_epsilon: float = 0.0
     train_csv: str = "train.csv"
     val_csv: str = "val.csv"
     test_csv: str = "offsite_test.csv"
@@ -535,6 +541,7 @@ def run_pipeline(config: RunnerConfig):
             tuning_method=config.tuning_method,
             loss_function=config.loss_function,
             attention=config.attention,
+            label_smoothing_epsilon=config.label_smoothing_epsilon,
             num_classes=config.num_classes,
             train_csv=config.train_csv,
             val_csv=config.val_csv,
