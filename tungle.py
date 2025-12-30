@@ -1,9 +1,10 @@
 import argparse
 import json
 import logging
+import copy
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -64,6 +65,7 @@ class RunnerConfig:
     loss_function: str = "bce"
     attention: str = "none"
     label_smoothing_epsilon: float = 0.0
+    mixup_alpha: float = 0.0
     train_csv: str = "train.csv"
     val_csv: str = "val.csv"
     test_csv: str = "offsite_test.csv"
@@ -76,7 +78,15 @@ class RunnerConfig:
     batch_size: int = 32
     lr: float = 1e-5
     weight_decay: float = 1e-4
+    use_cosine_scheduler: bool = False
     img_size: int = 256
+    use_randaugment: bool = False
+    randaugment_num_ops: int = 2
+    randaugment_magnitude: int = 9
+    use_ema: bool = False
+    ema_decay: float = 0.999
+    use_ema_for_eval: bool = False
+    use_tta_for_eval: bool = False
     save_dir: str = "checkpoints"
     pretrained_backbone: Optional[str] = "./pretrained_backbone/ckpt_resnet18_ep50.pt"
     do_train: bool = True
@@ -159,6 +169,55 @@ class AttnThenPool(nn.Module):
         x = self.attn(x)
         x = self.pool(x)
         return x
+
+
+# ========================
+# Training utilities
+# ========================
+class ModelEMA:
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.ema = copy.deepcopy(model)
+        self.ema.eval()
+        self.decay = decay
+        for param in self.ema.parameters():
+            param.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        ema_params = dict(self.ema.named_parameters())
+        model_params = dict(model.named_parameters())
+        for name, param in model_params.items():
+            if name in ema_params:
+                ema_param = ema_params[name]
+                ema_param.mul_(self.decay).add_(param.data, alpha=1.0 - self.decay)
+
+    def state_dict(self) -> Dict[str, torch.Tensor]:
+        return {"ema_state": self.ema.state_dict()}
+
+
+def apply_mixup(images: torch.Tensor, labels: torch.Tensor, alpha: float) -> tuple[torch.Tensor, torch.Tensor]:
+    if alpha <= 0:
+        return images, labels
+    lam = np.random.beta(alpha, alpha)
+    batch_size = images.size(0)
+    index = torch.randperm(batch_size, device=images.device)
+    mixed_images = lam * images + (1 - lam) * images[index, :]
+    mixed_labels = lam * labels + (1 - lam) * labels[index, :]
+    return mixed_images, mixed_labels
+
+
+def tta_predict(
+    model: nn.Module,
+    imgs: torch.Tensor,
+    use_tta: bool = False,
+) -> torch.Tensor:
+    if not use_tta:
+        return torch.sigmoid(model(imgs))
+
+    logits = []
+    logits.append(torch.sigmoid(model(imgs)))
+    logits.append(torch.sigmoid(model(torch.flip(imgs, dims=[3]))))  # horizontal flip
+    return torch.stack(logits, dim=0).mean(dim=0)
 
 
 # ========================
@@ -256,17 +315,45 @@ def build_model(backbone, num_classes, pretrained, attention):
     return model
 
 
-def build_transforms(img_size):
-    return transforms.Compose([
-        transforms.Resize((img_size, img_size)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+def build_transforms(
+    img_size: int,
+    train: bool = False,
+    use_randaugment: bool = False,
+    randaugment_num_ops: int = 2,
+    randaugment_magnitude: int = 9,
+):
+    augmentations: List[nn.Module] = []
+    if train:
+        augmentations.extend(
+            [
+                transforms.RandomResizedCrop(img_size, scale=(0.8, 1.0)),
+                transforms.RandomHorizontalFlip(),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
+            ]
+        )
+        if use_randaugment:
+            augmentations.append(
+                transforms.RandAugment(num_ops=randaugment_num_ops, magnitude=randaugment_magnitude)
+            )
+    else:
+        augmentations.append(transforms.Resize((img_size, img_size)))
+
+    augmentations.extend(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
+    return transforms.Compose(augmentations)
 
 
-def load_checkpoint(model, checkpoint_path, device, strict):
+def load_checkpoint(model, checkpoint_path, device, strict, use_ema_state: bool = False):
     state_dict = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(state_dict, strict=strict)
+    if isinstance(state_dict, dict) and "model_state" in state_dict:
+        model_state = state_dict.get("ema_state") if use_ema_state and "ema_state" in state_dict else state_dict["model_state"]
+    else:
+        model_state = state_dict
+    model.load_state_dict(model_state, strict=strict)
 
 
 # ========================
@@ -278,6 +365,7 @@ def train_one_backbone(
     loss_function,
     attention,
     label_smoothing_epsilon,
+    mixup_alpha,
     num_classes,
     train_csv,
     val_csv,
@@ -289,7 +377,13 @@ def train_one_backbone(
     batch_size,
     lr,
     weight_decay,
+    use_cosine_scheduler,
     img_size,
+    use_randaugment,
+    randaugment_num_ops,
+    randaugment_magnitude,
+    use_ema,
+    ema_decay,
     save_dir,
     pretrained_backbone,
 ):
@@ -298,11 +392,18 @@ def train_one_backbone(
     logger.debug("Training device: %s", describe_device(device))
 
     # transforms
-    transform = build_transforms(img_size)
+    transform_train = build_transforms(
+        img_size,
+        train=True,
+        use_randaugment=use_randaugment,
+        randaugment_num_ops=randaugment_num_ops,
+        randaugment_magnitude=randaugment_magnitude,
+    )
+    transform_eval = build_transforms(img_size, train=False)
 
     # dataset & dataloader
-    train_ds = RetinaMultiLabelDataset(train_csv, train_image_dir, transform)
-    val_ds = RetinaMultiLabelDataset(val_csv, val_image_dir, transform)
+    train_ds = RetinaMultiLabelDataset(train_csv, train_image_dir, transform_train)
+    val_ds = RetinaMultiLabelDataset(val_csv, val_image_dir, transform_eval)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
@@ -352,6 +453,13 @@ def train_one_backbone(
         optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=lr, weight_decay=weight_decay)
     else:
         optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
+    scheduler = None
+    if use_cosine_scheduler:
+        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=1, eta_min=lr * 0.1)
+
+    ema_helper: Optional[ModelEMA] = None
+    if use_ema:
+        ema_helper = ModelEMA(model, decay=ema_decay)
 
     # training
     os.makedirs(save_dir, exist_ok=True)
@@ -361,7 +469,7 @@ def train_one_backbone(
 
     # load pretrained backbone
     if pretrained_backbone is not None:
-        load_checkpoint(model, pretrained_backbone, device, strict=(attention == "none"))
+        load_checkpoint(model, pretrained_backbone, device, strict=(attention == "none"), use_ema_state=False)
 
     no_improve_patience = 0
     for epoch in range(epochs):
@@ -369,27 +477,32 @@ def train_one_backbone(
         train_loss = 0
         for imgs, labels in train_loader:
             imgs, labels = imgs.to(device), labels.to(device)
+            imgs, labels = apply_mixup(imgs, labels, alpha=mixup_alpha)
             # label smoothing
             if label_smoothing_epsilon > 0.0:
-                labels_smoothed = labels * (1.0 - label_smoothing_epsilon) + (1.0 - labels) * label_smoothing_epsilon 
-                labels = labels_smoothed
+                labels = labels * (1.0 - label_smoothing_epsilon) + (1.0 - labels) * label_smoothing_epsilon
             optimizer.zero_grad()
             outputs = model(imgs)
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
+            if ema_helper is not None:
+                ema_helper.update(model)
             train_loss += loss.item() * imgs.size(0)
 
         train_loss /= len(train_loader.dataset)
+        if scheduler is not None:
+            scheduler.step()
 
         # validation
         model.eval()
+        eval_model = ema_helper.ema if ema_helper is not None else model
         val_loss = 0.0
         y_true_val, y_pred_val = [], []
         with torch.no_grad():
             for imgs, labels in val_loader:
                 imgs, labels = imgs.to(device), labels.to(device)
-                outputs = model(imgs)
+                outputs = eval_model(imgs)
                 loss = criterion(outputs, labels)
                 val_loss += loss.item() * imgs.size(0)
 
@@ -418,7 +531,10 @@ def train_one_backbone(
         # save best-by-f1 (single checkpoint)
         if val_f1_macro > best_f1:
             best_f1 = val_f1_macro
-            torch.save(model.state_dict(), ckpt_path)
+            save_payload: Dict[str, Any] = {"model_state": model.state_dict()}
+            if ema_helper is not None:
+                save_payload.update(ema_helper.state_dict())
+            torch.save(save_payload, ckpt_path)
             logger.info("Saved best-by-f1 model for %s at %s (val_f1=%.4f)", backbone, ckpt_path, val_f1_macro)
             no_improve_patience = 0
         else:
@@ -435,15 +551,14 @@ def train_one_backbone(
     return ckpt_path
 
 
-def evaluate_model(model, test_loader, device, backbone):
+def evaluate_model(model, test_loader, device, backbone, use_tta: bool = False):
     model.eval()
     y_true, y_pred = [], []
 
     with torch.no_grad():
         for imgs, labels in test_loader:
             imgs = imgs.to(device)
-            outputs = model(imgs)
-            probs = torch.sigmoid(outputs).cpu().numpy()
+            probs = tta_predict(model, imgs, use_tta=use_tta).cpu().numpy()
             preds = (probs > 0.5).astype(int)
             y_true.extend(labels.numpy())
             y_pred.extend(preds)
@@ -483,25 +598,26 @@ def predict_from_images(
     batch_size,
     num_classes,
     attention,
+    use_tta_for_eval: bool,
+    use_ema_state: bool,
 ):
     device = get_device()
     logger.debug("Prediction device: %s", describe_device(device))
-    transform = build_transforms(img_size)
+    transform = build_transforms(img_size, train=False)
 
     predict_ds = RetinaPredictDataset(image_csv, image_dir, transform)
     predict_loader = DataLoader(predict_ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
     model = build_model(backbone, num_classes=num_classes, pretrained=False, attention=attention).to(device)
     log_model_details(model, backbone)
-    load_checkpoint(model, checkpoint_path, device, strict=(attention == "none"))
+    load_checkpoint(model, checkpoint_path, device, strict=(attention == "none"), use_ema_state=use_ema_state)
     model.eval()
 
     results = []
     with torch.no_grad():
         for image_names, imgs in predict_loader:
             imgs = imgs.to(device)
-            outputs = model(imgs)
-            probs = torch.sigmoid(outputs).cpu().numpy()
+            probs = tta_predict(model, imgs, use_tta=use_tta_for_eval).cpu().numpy()
             preds = (probs > 0.5).astype(int)
             for image_name, prob, pred in zip(image_names, probs, preds):
                 row = {"id": image_name}
@@ -544,6 +660,7 @@ def run_pipeline(config: RunnerConfig):
             loss_function=config.loss_function,
             attention=config.attention,
             label_smoothing_epsilon=config.label_smoothing_epsilon,
+            mixup_alpha=config.mixup_alpha,
             num_classes=config.num_classes,
             train_csv=config.train_csv,
             val_csv=config.val_csv,
@@ -555,7 +672,13 @@ def run_pipeline(config: RunnerConfig):
             batch_size=config.batch_size,
             lr=config.lr,
             weight_decay=config.weight_decay,
+            use_cosine_scheduler=config.use_cosine_scheduler,
             img_size=config.img_size,
+            use_randaugment=config.use_randaugment,
+            randaugment_num_ops=config.randaugment_num_ops,
+            randaugment_magnitude=config.randaugment_magnitude,
+            use_ema=config.use_ema,
+            ema_decay=config.ema_decay,
             save_dir=config.save_dir,
             pretrained_backbone=config.pretrained_backbone,
         )
@@ -565,13 +688,19 @@ def run_pipeline(config: RunnerConfig):
         checkpoint_path = config.pretrained_backbone
 
     if config.do_test:
-        transform = build_transforms(config.img_size)
+        transform = build_transforms(config.img_size, train=False)
         test_ds = RetinaMultiLabelDataset(config.test_csv, config.test_image_dir, transform)
         test_loader = DataLoader(test_ds, batch_size=config.batch_size, shuffle=False, num_workers=0)
         model = build_model(config.backbone, num_classes=config.num_classes, pretrained=False, attention=config.attention).to(device)
         log_model_details(model, config.backbone)
-        load_checkpoint(model, checkpoint_path, device, strict=(config.attention=="none"))
-        evaluate_model(model, test_loader, device, config.backbone)
+        load_checkpoint(
+            model,
+            checkpoint_path,
+            device,
+            strict=(config.attention=="none"),
+            use_ema_state=config.use_ema_for_eval,
+        )
+        evaluate_model(model, test_loader, device, config.backbone, use_tta=config.use_tta_for_eval)
 
     if config.do_predict:
         if config.predict_input_csv is None or config.predict_image_dir is None:
@@ -586,6 +715,8 @@ def run_pipeline(config: RunnerConfig):
             batch_size=config.batch_size,
             num_classes=config.num_classes,
             attention=config.attention,
+            use_tta_for_eval=config.use_tta_for_eval,
+            use_ema_state=config.use_ema_for_eval,
         )
 
 
