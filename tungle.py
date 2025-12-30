@@ -53,6 +53,45 @@ def log_model_details(model: nn.Module, backbone: str) -> None:
         total_params,
     )
 
+# =======================
+# Config class
+# =======================
+@dataclass
+class RunnerConfig:
+    backbone: str = "resnet18"
+    num_classes: int = 3
+    tuning_method: str = "full"
+    loss_function: str = "bce"
+    attention: str = "none"
+    label_smoothing_epsilon: float = 0.0
+    train_csv: str = "train.csv"
+    val_csv: str = "val.csv"
+    test_csv: str = "offsite_test.csv"
+    train_image_dir: str = "./images/train"
+    val_image_dir: str = "./images/val"
+    test_image_dir: str = "./images/offsite_test"
+    num_workers: int = 0
+    early_stopping_patience: int = 15
+    epochs: int = 20
+    batch_size: int = 32
+    lr: float = 1e-5
+    weight_decay: float = 1e-4
+    img_size: int = 256
+    save_dir: str = "checkpoints"
+    pretrained_backbone: Optional[str] = "./pretrained_backbone/ckpt_resnet18_ep50.pt"
+    do_train: bool = True
+    do_test: bool = True
+    do_predict: bool = False
+    predict_input_csv: Optional[str] = None
+    predict_image_dir: Optional[str] = None
+    predict_output_csv: str = "predictions.csv"
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "RunnerConfig":
+        known_fields = {field.name for field in cls.__dataclass_fields__.values()}
+        filtered = {key: value for key, value in data.items() if key in known_fields}
+        return cls(**filtered)
+
 
 # =======================
 # Custom Loss Functions
@@ -443,6 +482,7 @@ def predict_from_images(
     img_size,
     batch_size,
     num_classes,
+    attention,
 ):
     device = get_device()
     logger.debug("Prediction device: %s", describe_device(device))
@@ -451,9 +491,9 @@ def predict_from_images(
     predict_ds = RetinaPredictDataset(image_csv, image_dir, transform)
     predict_loader = DataLoader(predict_ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
-    model = build_model(backbone, num_classes=num_classes, pretrained=False, attention=config.attention).to(device)
+    model = build_model(backbone, num_classes=num_classes, pretrained=False, attention=attention).to(device)
     log_model_details(model, backbone)
-    load_checkpoint(model, checkpoint_path, device, strict=(config.attention=="none"))
+    load_checkpoint(model, checkpoint_path, device, strict=(attention == "none"))
     model.eval()
 
     results = []
@@ -471,44 +511,6 @@ def predict_from_images(
 
     pd.DataFrame(results).to_csv(output_csv, index=False)
     logger.info("Saved predictions to %s", output_csv)
-
-
-@dataclass
-class RunnerConfig:
-    backbone: str = "resnet18"
-    num_classes: int = 3
-    tuning_method: str = "full"
-    loss_function: str = "bce"
-    attention: str = "none"
-    label_smoothing_epsilon: float = 0.0
-    train_csv: str = "train.csv"
-    val_csv: str = "val.csv"
-    test_csv: str = "offsite_test.csv"
-    train_image_dir: str = "./images/train"
-    val_image_dir: str = "./images/val"
-    test_image_dir: str = "./images/offsite_test"
-    num_workers: int = 0
-    early_stopping_patience: int = 15
-    epochs: int = 20
-    batch_size: int = 32
-    lr: float = 1e-5
-    weight_decay: float = 1e-4
-    img_size: int = 256
-    save_dir: str = "checkpoints"
-    pretrained_backbone: Optional[str] = "./pretrained_backbone/ckpt_resnet18_ep50.pt"
-    checkpoint_path: Optional[str] = None
-    do_train: bool = True
-    do_test: bool = True
-    do_predict: bool = False
-    predict_input_csv: Optional[str] = None
-    predict_image_dir: Optional[str] = None
-    predict_output_csv: str = "predictions.csv"
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "RunnerConfig":
-        known_fields = {field.name for field in cls.__dataclass_fields__.values()}
-        filtered = {key: value for key, value in data.items() if key in known_fields}
-        return cls(**filtered)
 
 
 def run_pipeline(config: RunnerConfig):
@@ -534,7 +536,7 @@ def run_pipeline(config: RunnerConfig):
     logger.info("Selected device: %s", describe_device(device))
     logger.info("Backbone: %s", config.backbone)
 
-    checkpoint_path = config.checkpoint_path
+    checkpoint_path: Optional[str] = None
     if config.do_train:
         checkpoint_path = train_one_backbone(
             backbone=config.backbone,
@@ -557,10 +559,9 @@ def run_pipeline(config: RunnerConfig):
             save_dir=config.save_dir,
             pretrained_backbone=config.pretrained_backbone,
         )
-    elif checkpoint_path is None and config.pretrained_backbone is None:
-        raise ValueError("Provide checkpoint_path or pretrained_backbone when training is disabled.")
-
-    if not config.do_train and checkpoint_path is None:
+    else:
+        if config.pretrained_backbone is None:
+            raise ValueError("Provide pretrained_backbone when training is disabled.")
         checkpoint_path = config.pretrained_backbone
 
     if config.do_test:
@@ -584,6 +585,7 @@ def run_pipeline(config: RunnerConfig):
             img_size=config.img_size,
             batch_size=config.batch_size,
             num_classes=config.num_classes,
+            attention=config.attention,
         )
 
 
