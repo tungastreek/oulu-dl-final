@@ -460,10 +460,11 @@ def evaluate_model(model, test_loader, device, backbone):
             y_pred.extend(preds)
 
             if image_names is not None:
-                for image_name, prob in zip(image_names, probs):
+                for image_name, prob, pred in zip(image_names, probs, preds):
                     row = {"id": image_name}
                     for idx, disease in enumerate(DISEASE_NAMES):
                         row[f"{disease}_prob"] = float(prob[idx])
+                        row[disease] = int(pred[idx])
                     offline_results.append(row)
 
     y_true = torch.tensor(np.array(y_true)).numpy()
@@ -592,7 +593,12 @@ def run_pipeline(config: RunnerConfig):
         load_checkpoint(model, checkpoint_path, device, strict=(config.attention=="none"))
         offline_results = evaluate_model(model, test_loader, device, config.backbone)
         if offline_results:
-            pd.DataFrame(offline_results).to_csv(config.offline_result_csv, index=False)
+            columns = ["id"]
+            for disease in DISEASE_NAMES:
+                columns.extend([f"{disease}_prob", disease])
+            df = pd.DataFrame(offline_results)
+            df = df.reindex(columns=columns)
+            df.to_csv(config.offline_result_csv, index=False)
             logger.info("Saved offline predictions with probabilities to %s", config.offline_result_csv)
 
     if config.do_predict:
