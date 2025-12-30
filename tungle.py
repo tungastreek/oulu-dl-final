@@ -85,6 +85,7 @@ class RunnerConfig:
     predict_input_csv: Optional[str] = None
     predict_image_dir: Optional[str] = None
     predict_output_csv: str = "predictions.csv"
+    offline_result_csv: str = "offline_result.csv"
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "RunnerConfig":
@@ -165,21 +166,25 @@ class AttnThenPool(nn.Module):
 # Dataset preparation
 # ========================
 class RetinaMultiLabelDataset(Dataset):
-    def __init__(self, csv_file, image_dir, transform=None):
+    def __init__(self, csv_file, image_dir, transform=None, include_id: bool = False):
         self.data = pd.read_csv(csv_file)
         self.image_dir = image_dir
         self.transform = transform
+        self.include_id = include_id
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
         row = self.data.iloc[idx]
-        img_path = os.path.join(self.image_dir, row.iloc[0])
+        image_name = row.iloc[0]
+        img_path = os.path.join(self.image_dir, image_name)
         img = Image.open(img_path).convert("RGB")
         labels = torch.tensor(row[1:].values.astype("float32"))
         if self.transform:
             img = self.transform(img)
+        if self.include_id:
+            return img, labels, image_name
         return img, labels
 
 
@@ -438,15 +443,28 @@ def train_one_backbone(
 def evaluate_model(model, test_loader, device, backbone):
     model.eval()
     y_true, y_pred = [], []
-
+    offline_results = []
     with torch.no_grad():
-        for imgs, labels in test_loader:
+        for batch in test_loader:
+            if len(batch) == 3:
+                imgs, labels, image_names = batch
+            else:
+                imgs, labels = batch
+                image_names = None
+
             imgs = imgs.to(device)
             outputs = model(imgs)
             probs = torch.sigmoid(outputs).cpu().numpy()
             preds = (probs > 0.5).astype(int)
             y_true.extend(labels.numpy())
             y_pred.extend(preds)
+
+            if image_names is not None:
+                for image_name, prob in zip(image_names, probs):
+                    row = {"id": image_name}
+                    for idx, disease in enumerate(DISEASE_NAMES):
+                        row[f"{disease}_prob"] = float(prob[idx])
+                    offline_results.append(row)
 
     y_true = torch.tensor(np.array(y_true)).numpy()
     y_pred = torch.tensor(np.array(y_pred)).numpy()
@@ -472,6 +490,7 @@ def evaluate_model(model, test_loader, device, backbone):
             kappa,
         )
 
+    return offline_results
 
 def predict_from_images(
     backbone,
@@ -566,12 +585,15 @@ def run_pipeline(config: RunnerConfig):
 
     if config.do_test:
         transform = build_transforms(config.img_size)
-        test_ds = RetinaMultiLabelDataset(config.test_csv, config.test_image_dir, transform)
+        test_ds = RetinaMultiLabelDataset(config.test_csv, config.test_image_dir, transform, include_id=True)
         test_loader = DataLoader(test_ds, batch_size=config.batch_size, shuffle=False, num_workers=0)
         model = build_model(config.backbone, num_classes=config.num_classes, pretrained=False, attention=config.attention).to(device)
         log_model_details(model, config.backbone)
         load_checkpoint(model, checkpoint_path, device, strict=(config.attention=="none"))
-        evaluate_model(model, test_loader, device, config.backbone)
+        offline_results = evaluate_model(model, test_loader, device, config.backbone)
+        if offline_results:
+            pd.DataFrame(offline_results).to_csv(config.offline_result_csv, index=False)
+            logger.info("Saved offline predictions with probabilities to %s", config.offline_result_csv)
 
     if config.do_predict:
         if config.predict_input_csv is None or config.predict_image_dir is None:
