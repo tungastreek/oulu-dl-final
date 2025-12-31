@@ -63,6 +63,8 @@ class RunnerConfig:
     tuning_method: str = "full"
     loss_function: str = "bce"
     attention: str = "none"
+    use_imagenet_pretrained: bool = True
+    use_strong_augmentations: bool = True
     label_smoothing_epsilon: float = 0.0
     train_csv: str = "train.csv"
     val_csv: str = "val.csv"
@@ -226,6 +228,30 @@ def build_model(backbone, num_classes, pretrained, attention):
                 raise ValueError("Unsupported attention mechanism")
             model.avgpool = AttnThenPool(attn, model.avgpool)
 
+    # convnext
+    elif backbone == "convnext_tiny":
+        weights = models.ConvNeXt_Tiny_Weights.DEFAULT if pretrained else None
+        model = models.convnext_tiny(weights=weights)
+        model.classifier[2] = nn.Linear(model.classifier[2].in_features, num_classes)
+        if attention != "none":
+            raise ValueError("Attention mechanisms not supported for ConvNeXt backbone")
+
+    # efficientnet v2
+    elif backbone == "efficientnet_v2_m":
+        weights = models.EfficientNet_V2_M_Weights.DEFAULT if pretrained else None
+        model = models.efficientnet_v2_m(weights=weights)
+        model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
+        if attention != "none":
+            raise ValueError("Attention mechanisms not supported for EfficientNet V2 backbone")
+
+    # vision transformer
+    elif backbone == "vit_b_16":
+        weights = models.ViT_B_16_Weights.DEFAULT if pretrained else None
+        model = models.vit_b_16(weights=weights)
+        model.heads.head = nn.Linear(model.heads.head.in_features, num_classes)
+        if attention != "none":
+            raise ValueError("Attention mechanisms not supported for ViT backbone")
+
     # efficientnet
     elif backbone == "efficientnet":
         # weights
@@ -256,11 +282,25 @@ def build_model(backbone, num_classes, pretrained, attention):
     return model
 
 
-def build_transforms(img_size):
+def build_transforms(img_size, train=False, strong_augmentations=True):
+    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    if train:
+        augmentations = [
+            transforms.RandomResizedCrop((img_size, img_size), scale=(0.8, 1.0)),
+            transforms.RandomHorizontalFlip(),
+        ]
+        if strong_augmentations:
+            augmentations.extend([
+                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
+                transforms.RandomRotation(degrees=15),
+                transforms.RandomAutocontrast(),
+            ])
+        augmentations.extend([transforms.ToTensor(), normalize])
+        return transforms.Compose(augmentations)
     return transforms.Compose([
         transforms.Resize((img_size, img_size)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        normalize,
     ])
 
 
@@ -277,6 +317,8 @@ def train_one_backbone(
     tuning_method,
     loss_function,
     attention,
+    use_imagenet_pretrained,
+    use_strong_augmentations,
     label_smoothing_epsilon,
     num_classes,
     train_csv,
@@ -298,11 +340,12 @@ def train_one_backbone(
     logger.debug("Training device: %s", describe_device(device))
 
     # transforms
-    transform = build_transforms(img_size)
+    train_transform = build_transforms(img_size, train=True, strong_augmentations=use_strong_augmentations)
+    eval_transform = build_transforms(img_size, train=False, strong_augmentations=False)
 
     # dataset & dataloader
-    train_ds = RetinaMultiLabelDataset(train_csv, train_image_dir, transform)
-    val_ds = RetinaMultiLabelDataset(val_csv, val_image_dir, transform)
+    train_ds = RetinaMultiLabelDataset(train_csv, train_image_dir, train_transform)
+    val_ds = RetinaMultiLabelDataset(val_csv, val_image_dir, eval_transform)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
@@ -320,7 +363,7 @@ def train_one_backbone(
     logger.info("alpha (focal)     D,G,A: %s", focal_alpha.detach().cpu().numpy().round(4).tolist())
 
     # model
-    model = build_model(backbone, num_classes=num_classes, pretrained=False, attention=attention).to(device)
+    model = build_model(backbone, num_classes=num_classes, pretrained=use_imagenet_pretrained, attention=attention).to(device)
 
     for p in model.parameters():
         p.requires_grad = False
@@ -483,15 +526,16 @@ def predict_from_images(
     batch_size,
     num_classes,
     attention,
+    use_imagenet_pretrained,
 ):
     device = get_device()
     logger.debug("Prediction device: %s", describe_device(device))
-    transform = build_transforms(img_size)
+    transform = build_transforms(img_size, train=False, strong_augmentations=False)
 
     predict_ds = RetinaPredictDataset(image_csv, image_dir, transform)
     predict_loader = DataLoader(predict_ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
-    model = build_model(backbone, num_classes=num_classes, pretrained=False, attention=attention).to(device)
+    model = build_model(backbone, num_classes=num_classes, pretrained=use_imagenet_pretrained, attention=attention).to(device)
     log_model_details(model, backbone)
     load_checkpoint(model, checkpoint_path, device, strict=(attention == "none"))
     model.eval()
@@ -543,6 +587,8 @@ def run_pipeline(config: RunnerConfig):
             tuning_method=config.tuning_method,
             loss_function=config.loss_function,
             attention=config.attention,
+            use_imagenet_pretrained=config.use_imagenet_pretrained,
+            use_strong_augmentations=config.use_strong_augmentations,
             label_smoothing_epsilon=config.label_smoothing_epsilon,
             num_classes=config.num_classes,
             train_csv=config.train_csv,
@@ -565,10 +611,15 @@ def run_pipeline(config: RunnerConfig):
         checkpoint_path = config.pretrained_backbone
 
     if config.do_test:
-        transform = build_transforms(config.img_size)
+        transform = build_transforms(config.img_size, train=False, strong_augmentations=False)
         test_ds = RetinaMultiLabelDataset(config.test_csv, config.test_image_dir, transform)
         test_loader = DataLoader(test_ds, batch_size=config.batch_size, shuffle=False, num_workers=0)
-        model = build_model(config.backbone, num_classes=config.num_classes, pretrained=False, attention=config.attention).to(device)
+        model = build_model(
+            config.backbone,
+            num_classes=config.num_classes,
+            pretrained=config.use_imagenet_pretrained,
+            attention=config.attention,
+        ).to(device)
         log_model_details(model, config.backbone)
         load_checkpoint(model, checkpoint_path, device, strict=(config.attention=="none"))
         evaluate_model(model, test_loader, device, config.backbone)
@@ -586,6 +637,7 @@ def run_pipeline(config: RunnerConfig):
             batch_size=config.batch_size,
             num_classes=config.num_classes,
             attention=config.attention,
+            use_imagenet_pretrained=config.use_imagenet_pretrained,
         )
 
 
