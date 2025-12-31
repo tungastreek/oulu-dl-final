@@ -62,6 +62,8 @@ class RunnerConfig:
     num_classes: int = 3
     tuning_method: str = "full"
     loss_function: str = "bce"
+    amd_focus: bool = False
+    amd_weight_boost: float = 1.5
     attention: str = "none"
     label_smoothing_epsilon: float = 0.0
     train_csv: str = "train.csv"
@@ -79,6 +81,10 @@ class RunnerConfig:
     img_size: int = 256
     save_dir: str = "checkpoints"
     pretrained_backbone: Optional[str] = "./pretrained_backbone/ckpt_resnet18_ep50.pt"
+    use_ensemble: bool = True
+    ensemble_checkpoint: Optional[str] = "./checkpoints/best_swin.pt"
+    ensemble_backbone: str = "swin"
+    ensemble_attention: str = "none"
     do_train: bool = True
     do_test: bool = True
     do_predict: bool = False
@@ -269,6 +275,39 @@ def load_checkpoint(model, checkpoint_path, device, strict):
     model.load_state_dict(state_dict, strict=strict)
 
 
+def maybe_build_ensemble_model(
+    use_ensemble: bool,
+    ensemble_checkpoint: Optional[str],
+    ensemble_backbone: str,
+    num_classes: int,
+    attention: str,
+    device: torch.device,
+) -> Optional[nn.Module]:
+    if not use_ensemble or ensemble_checkpoint is None:
+        return None
+    if not os.path.isfile(ensemble_checkpoint):
+        logger.warning("Ensemble checkpoint not found at %s; skipping ensemble.", ensemble_checkpoint)
+        return None
+    logger.info("Loading ensemble model from %s (backbone=%s)", ensemble_checkpoint, ensemble_backbone)
+
+    ensemble_model = build_model(
+        ensemble_backbone,
+        num_classes=num_classes,
+        pretrained=False,
+        attention=attention,
+    ).to(device)
+    load_checkpoint(ensemble_model, ensemble_checkpoint, device, strict=(attention == "none"))
+    log_model_details(ensemble_model, ensemble_backbone)
+    ensemble_model.eval()
+    return ensemble_model
+
+
+def average_probabilities(primary_probs: torch.Tensor, ensemble_probs: Optional[torch.Tensor]) -> torch.Tensor:
+    if ensemble_probs is None:
+        return primary_probs
+    return (primary_probs + ensemble_probs) / 2.0
+
+
 # ========================
 # model training and val
 # ========================
@@ -277,6 +316,8 @@ def train_one_backbone(
     tuning_method,
     loss_function,
     attention,
+    amd_focus,
+    amd_weight_boost,
     label_smoothing_epsilon,
     num_classes,
     train_csv,
@@ -315,6 +356,10 @@ def train_one_backbone(
     eps = 1e-6
     pos_weight = torch.tensor(neg / (pos + eps), dtype=torch.float32, device=device).clamp(min=0.0)  # wbce
     focal_alpha = torch.tensor(neg / (n + eps), dtype=torch.float32, device=device).clamp(0.0, 1.0)  # focal
+    if amd_focus and "A" in DISEASE_NAMES:
+        amd_idx = DISEASE_NAMES.index("A")
+        pos_weight[amd_idx] *= amd_weight_boost
+        focal_alpha[amd_idx] = torch.clamp(focal_alpha[amd_idx] * amd_weight_boost, 0.0, 1.0)
 
     logger.info("pos_weight (wbce) D,G,A: %s", pos_weight.detach().cpu().numpy().round(4).tolist())
     logger.info("alpha (focal)     D,G,A: %s", focal_alpha.detach().cpu().numpy().round(4).tolist())
@@ -341,7 +386,8 @@ def train_one_backbone(
 
     # loss & optimizer
     if loss_function == "bce":
-        criterion = nn.BCEWithLogitsLoss()
+        pos_w = pos_weight if amd_focus else None
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_w)
     elif loss_function == "focal":
         criterion = FocalLoss(alpha=focal_alpha, gamma=2)
     elif loss_function == "wbce":
@@ -435,15 +481,16 @@ def train_one_backbone(
     return ckpt_path
 
 
-def evaluate_model(model, test_loader, device, backbone):
+def evaluate_model(model, test_loader, device, backbone, ensemble_model: Optional[nn.Module] = None):
     model.eval()
     y_true, y_pred = [], []
 
     with torch.no_grad():
         for imgs, labels in test_loader:
             imgs = imgs.to(device)
-            outputs = model(imgs)
-            probs = torch.sigmoid(outputs).cpu().numpy()
+            primary_probs = torch.sigmoid(model(imgs))
+            ensemble_probs = torch.sigmoid(ensemble_model(imgs)) if ensemble_model is not None else None
+            probs = average_probabilities(primary_probs, ensemble_probs).cpu().numpy()
             preds = (probs > 0.5).astype(int)
             y_true.extend(labels.numpy())
             y_pred.extend(preds)
@@ -483,6 +530,7 @@ def predict_from_images(
     batch_size,
     num_classes,
     attention,
+    ensemble_model: Optional[nn.Module] = None,
 ):
     device = get_device()
     logger.debug("Prediction device: %s", describe_device(device))
@@ -500,8 +548,9 @@ def predict_from_images(
     with torch.no_grad():
         for image_names, imgs in predict_loader:
             imgs = imgs.to(device)
-            outputs = model(imgs)
-            probs = torch.sigmoid(outputs).cpu().numpy()
+            primary_probs = torch.sigmoid(model(imgs))
+            ensemble_probs = torch.sigmoid(ensemble_model(imgs)) if ensemble_model is not None else None
+            probs = average_probabilities(primary_probs, ensemble_probs).cpu().numpy()
             preds = (probs > 0.5).astype(int)
             for image_name, prob, pred in zip(image_names, probs, preds):
                 row = {"id": image_name}
@@ -543,6 +592,8 @@ def run_pipeline(config: RunnerConfig):
             tuning_method=config.tuning_method,
             loss_function=config.loss_function,
             attention=config.attention,
+            amd_focus=config.amd_focus,
+            amd_weight_boost=config.amd_weight_boost,
             label_smoothing_epsilon=config.label_smoothing_epsilon,
             num_classes=config.num_classes,
             train_csv=config.train_csv,
@@ -564,6 +615,17 @@ def run_pipeline(config: RunnerConfig):
             raise ValueError("Provide pretrained_backbone when training is disabled.")
         checkpoint_path = config.pretrained_backbone
 
+    ensemble_model = maybe_build_ensemble_model(
+        use_ensemble=config.use_ensemble,
+        ensemble_checkpoint=config.ensemble_checkpoint,
+        ensemble_backbone=config.ensemble_backbone,
+        num_classes=config.num_classes,
+        attention=config.ensemble_attention,
+        device=device,
+    )
+    if ensemble_model is None and config.use_ensemble:
+        logger.info("Proceeding without ensemble due to missing or disabled ensemble configuration.")
+
     if config.do_test:
         transform = build_transforms(config.img_size)
         test_ds = RetinaMultiLabelDataset(config.test_csv, config.test_image_dir, transform)
@@ -571,7 +633,7 @@ def run_pipeline(config: RunnerConfig):
         model = build_model(config.backbone, num_classes=config.num_classes, pretrained=False, attention=config.attention).to(device)
         log_model_details(model, config.backbone)
         load_checkpoint(model, checkpoint_path, device, strict=(config.attention=="none"))
-        evaluate_model(model, test_loader, device, config.backbone)
+        evaluate_model(model, test_loader, device, config.backbone, ensemble_model=ensemble_model)
 
     if config.do_predict:
         if config.predict_input_csv is None or config.predict_image_dir is None:
@@ -586,6 +648,7 @@ def run_pipeline(config: RunnerConfig):
             batch_size=config.batch_size,
             num_classes=config.num_classes,
             attention=config.attention,
+            ensemble_model=ensemble_model,
         )
 
 
